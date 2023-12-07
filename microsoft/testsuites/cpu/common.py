@@ -32,7 +32,7 @@ def set_interrupts_assigned_cpu(
     file_path_list: Dict[str, str] = {}
     # the vmbus interrupt channel reassignment feature is available in 5.8+ kernel and
     # vmbus version in 4.1+, the vmbus version is negotiated with the host.
-    if kernel_version >= "5.8.0" and vmbus_version >= "4.1.0":
+    if vmbus_version >= "4.1.0":
         # save the raw cpu number for each channel for restoring later.
         channels = lsvmbus.get_device_channels(force_run=True)
         for channel in channels:
