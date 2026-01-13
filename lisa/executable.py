@@ -452,6 +452,48 @@ class CustomScript(Tool):
     def dependencies(self) -> List[Type[Tool]]:
         return self._dependencies
 
+    def _copy_files_into_executable_dir(
+        self, path: pathlib.PurePath, files: List[pathlib.PurePath]
+    ) -> pathlib.PurePath:
+        """
+        On remote POSIX nodes, copy the given files into the first existing
+        directory among ['/usr/local/bin', '/usr/bin', '/opt'] and return that
+        target directory path.
+        """
+        if not self.node.is_remote or not self.node.is_posix:
+            return path
+
+        preferred_dirs = ["/usr/local/bin", "/usr/bin", "/opt"]
+        srcs = [path.joinpath(f) for f in files]
+
+        for d in preferred_dirs:
+            target_dir = pathlib.PurePosixPath(d)
+            if not self.node.shell.exists(target_dir):
+                continue
+
+            # Log potential overwrites
+            for f in files:
+                dest = target_dir.joinpath(f)
+                if self.node.shell.exists(dest):
+                    self._log.warning(
+                        f"overwriting existing file at '{dest}' with "
+                        f"'{path.joinpath(f)}'"
+                    )
+
+            # Copy all files in a single command so failure means all failed
+            src_list = " ".join(f"'{str(s)}'" for s in srcs)
+            cmd = f"cp -f {src_list} '{str(target_dir)}'"
+            result = self.node.execute(cmd, shell=True, sudo=True)
+            if result.exit_code != 0:
+                self._log.debug(
+                    f"failed copying scripts to {target_dir}: {result.stdout}"
+                    f" {result.stderr}"
+                )
+                continue
+
+            return target_dir
+        return path
+
     def install(self) -> bool:
         if self.node.is_remote:
             # copy to remote
@@ -462,6 +504,21 @@ class CustomScript(Tool):
                 self.node.shell.copy(source_path, remote_path)
                 self.node.shell.chmod(remote_path, 0o755)
             self._cwd = node_script_path
+            if self.node.is_posix and self.node.is_path_mounted_noexec(
+                str(node_script_path)
+            ):
+                self._log.debug(
+                    f"Path {node_script_path} is on a 'noexec' filesystem. It cannot be"
+                    " executed directly, will copy to an alternate location"
+                )
+                # Some systems are not allowed to copy files from local node to
+                # /usr/local/bin, /usr/bin, /opt directly due to permission issues.
+                # So if the node_script_path is on a 'noexec' filesystem, we first copy
+                # the files to node_script_path, then copy them to the alternate
+                # location. Copy *all* files in one command so that failure is atomic.
+                self._cwd = self._copy_files_into_executable_dir(
+                    node_script_path, self._files
+                )
         else:
             self._cwd = self._local_path
 
