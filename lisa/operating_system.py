@@ -906,7 +906,8 @@ class Debian(Linux):
                 key_basename = os.path.basename(key_file_path)
                 self._node.execute(
                     cmd=(
-                        f"gpg --dearmor -o /etc/apt/trusted.gpg.d/{key_basename}.gpg "
+                        "gpg --yes --dearmor -o "
+                        f"/etc/apt/trusted.gpg.d/{key_basename}.gpg "
                         f"{key_file_path}"
                     ),
                     sudo=True,
@@ -1356,6 +1357,16 @@ class Ubuntu(Debian):
         # /etc/apt/source.list file
         # not add expected_exit_code, since for other platforms
         # it may not have cloud-init
+
+        # Skip cloud-init wait for WSL guest nodes - cloud-init doesn't work in WSL
+        # Use class name check to avoid circular import
+        if self._node.__class__.__name__ == "WslContainerNode":
+            self._log.debug(
+                "Skipping cloud-init wait for WSL guest node "
+                "(cloud-init not applicable in WSL)"
+            )
+            return
+
         self._node.execute("cloud-init status --wait", sudo=True)
 
     def _get_information(self) -> OsInformation:
@@ -2371,7 +2382,27 @@ class Suse(Linux):
         install_result = self._node.execute(
             command, shell=True, sudo=True, timeout=timeout
         )
-        if install_result.exit_code in (1, 100):
+
+        # zypper exit codes that indicate dependency/resolution issues:
+        # 1: ZYPPER_EXIT_ERR_BUG - Unexpected situation
+        # 4: ZYPPER_EXIT_INF_CAP_NOT_FOUND - Capability not found or dependency problem
+        # 100: ZYPPER_EXIT_INF_UPDATE_NEEDED - Updates available
+        # If installation failed due to dependency conflicts, retry with
+        # --force-resolution to allow zypper to automatically resolve conflicts
+        if install_result.exit_code in (1, 4, 100):
+            self._log.debug(
+                f"Installation failed with exit code {install_result.exit_code}, "
+                "retrying with --force-resolution to resolve dependency conflicts."
+            )
+            command_with_force = f"zypper --non-interactive {add_args}"
+            if not signed:
+                command_with_force += " --no-gpg-checks "
+            command_with_force += f" in --force-resolution {' '.join(packages)}"
+            install_result = self._node.execute(
+                command_with_force, shell=True, sudo=True, timeout=timeout
+            )
+
+        if install_result.exit_code in (1, 4, 100):
             raise LisaException(
                 f"Failed to install {packages}. exit_code: {install_result.exit_code}, "
                 f"stderr: {install_result.stderr}"

@@ -17,12 +17,49 @@ from agent_framework import (
 from agent_framework.azure import AzureOpenAIChatClient
 
 from . import logger
-from .common import create_agent_chat_options, get_current_directory
+from .common import (
+    AGENT_MAX_TOKENS,
+    AGENT_TEMPERATURE,
+    AGENT_TOP_P,
+    get_current_directory,
+)
 
 # Define agent name constants
 LOG_SEARCH_AGENT_NAME = "LogSearchAgent"
 CODE_SEARCH_AGENT_NAME = "CodeSearchAgent"
 SUMMARY_AGENT_NAME = "SummaryAgent"
+MAX_SEARCH_CONTEXT_ITEMS = 200
+MAX_MATCHED_TEXT_CHARS = 500
+MAX_READ_LINE_COUNT = 300
+MAX_READ_TEXT_CHARS = 30000
+MAX_LIST_FILES_RETURN = 200
+
+
+def _chat_message_to_text(message: Any) -> str:
+    text = getattr(message, "text", None)
+    if isinstance(text, str):
+        return text
+
+    content = getattr(message, "content", None)
+    if isinstance(content, str):
+        return content
+
+    if content is not None:
+        return str(content)
+
+    return str(message)
+
+
+def _truncate_text(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+
+    truncated_count = len(text) - max_chars
+    logger.info(
+        f"Truncating text from {len(text)} chars to {max_chars} chars, "
+        f"truncated {truncated_count} chars."
+    )
+    return f"{text[:max_chars]}\n...[truncated {truncated_count} chars]"
 
 
 def _load_prompt(prompt_filename: str, flow: str) -> str:
@@ -88,7 +125,7 @@ class FileSearchPlugin:
             return valid_result
 
         # Combined results
-        log_context: Dict[str, List[Dict[str, Union[str, int]]]] = {"context": []}
+        log_context: Dict[str, Any] = {"context": []}
 
         files_found = 0
 
@@ -127,20 +164,45 @@ class FileSearchPlugin:
                                 # Ensure we use the absolute, normalized path
                                 parsed_line["file_path"] = os.path.abspath(file_path)
                                 parsed_line["match_line_number"] = i
-                                parsed_line["matched_text"] = line_content
+                                parsed_line["matched_text"] = _truncate_text(
+                                    line_content,
+                                    MAX_MATCHED_TEXT_CHARS,
+                                )
 
                                 log_context["context"].append(parsed_line)
+                                if (
+                                    len(log_context["context"])
+                                    >= MAX_SEARCH_CONTEXT_ITEMS
+                                ):
+                                    logger.info(
+                                        "Reached max search context items "
+                                        f"limit of {MAX_SEARCH_CONTEXT_ITEMS}, "
+                                        f"stopping search."
+                                    )
+                                    break
+
+                        if len(log_context["context"]) >= MAX_SEARCH_CONTEXT_ITEMS:
+                            logger.info(
+                                "Reached max search context items limit of "
+                                f"{MAX_SEARCH_CONTEXT_ITEMS}, stopping search."
+                            )
+                            break
 
                 except Exception as e:
                     logger.info(f"Error processing file {file_path}: {str(e)}")
                     continue
+
+            if len(log_context["context"]) >= MAX_SEARCH_CONTEXT_ITEMS:
+                break
+
+        if len(log_context["context"]) >= MAX_SEARCH_CONTEXT_ITEMS:
+            logger.info(f"Search results capped at {MAX_SEARCH_CONTEXT_ITEMS} items.")
 
         match_count = len(log_context["context"])
         logger.info(
             f"Searched '{search_string}', {files_found} files processed, "
             f"{match_count} matches found."
         )
-
         return log_context
 
     def read_text_file(
@@ -191,7 +253,8 @@ class FileSearchPlugin:
             return {"error": error_message}
 
         traceback_start = max(1, start_line_offset)
-        traceback_end = traceback_start + line_count - 1
+        bounded_line_count = min(line_count, MAX_READ_LINE_COUNT)
+        traceback_end = traceback_start + bounded_line_count - 1
 
         try:
             with open(norm_path, "r", encoding="utf-8") as f:
@@ -210,7 +273,9 @@ class FileSearchPlugin:
             return {"error": error_message}
 
         result = "\n".join(traceback)
+        result = _truncate_text(result, MAX_READ_TEXT_CHARS)
         logger.debug(f"read_text_file result: {result}")
+
         return {"content": result}
 
     def _validate_list_files_input(
@@ -312,7 +377,7 @@ class FileSearchPlugin:
 
         # Calculate pagination boundaries
         start = offset
-        end = min(offset + max_files, total_files)
+        end = min(offset + max_files, total_files, offset + MAX_LIST_FILES_RETURN)
         paginated_files = files[start:end]
 
         # Calculate pagination metadata
@@ -448,16 +513,15 @@ class FileSearchAgentBase(ChatAgent):  # type: ignore
             plugin.read_text_file,
             plugin.list_files,
         ]
-        chat_options = create_agent_chat_options()
         super().__init__(
             chat_client=chat_client,
             name=name,
             description=description,
             instructions=instructions,
             tools=tools,
-            temperature=chat_options.temperature,
-            top_p=chat_options.top_p,
-            additional_properties={"max_completion_tokens": chat_options.max_tokens},
+            temperature=AGENT_TEMPERATURE,
+            top_p=AGENT_TOP_P,
+            additional_properties={"max_completion_tokens": AGENT_MAX_TOKENS},
         )
 
     def _create_chat_client(
@@ -578,6 +642,35 @@ def extract_final_text(messages: List[ChatMessage]) -> str:
     return ""
 
 
+def _find_latest_serial_console_log_path(
+    log_folder_path: List[str],
+) -> Optional[str]:
+    """
+    Find serial_console.log under provided log paths.
+
+    If multiple files are found, select the last one
+    """
+
+    latest_serial_log_path: Optional[str] = None
+
+    for base_path in log_folder_path:
+        normalized_base_path = os.path.normpath(base_path)
+
+        if not os.path.exists(normalized_base_path):
+            continue
+
+        for root, dirs, files in os.walk(normalized_base_path):
+            dirs.sort()
+            files.sort()
+            for file_name in files:
+                if "serial_console.log" not in file_name:
+                    continue
+
+                latest_serial_log_path = os.path.abspath(os.path.join(root, file_name))
+
+    return latest_serial_log_path
+
+
 async def async_analyze_default(
     azure_openai_api_key: str,
     azure_openai_endpoint: str,
@@ -592,12 +685,37 @@ async def async_analyze_default(
     """
     system_instructions = _load_prompt("user.txt", flow="default")
 
+    trigger_keywords = [
+        "cannot connect to",
+        "OSProvisioningTimedOut",
+        "failed to connect",
+        "KernelPanicException",
+    ]
+    normalized_error_message = error_message.lower()
+    do_search_serial_console_log = any(
+        keyword in normalized_error_message for keyword in trigger_keywords
+    )
+
+    serial_console_log_path: Optional[str] = None
+    serial_console_prompt_block = ""
+    if do_search_serial_console_log:
+        serial_console_log_path = _find_latest_serial_console_log_path(log_folder_path)
+        if serial_console_log_path:
+            logger.info(f"Selected serial_console.log: {serial_console_log_path}")
+        else:
+            logger.info("serial_console.log not found under provided log_folder_path")
+
+        serial_console_prompt_block = (
+            f"**SELECTED SERIAL CONSOLE LOG PATH: **\n{serial_console_log_path}\n"
+        )
+
     # Include the actual error message in the analysis prompt
     analysis_prompt = f"""{system_instructions}
 **ERROR MESSAGE TO ANALYZE: **
 {error_message}
 **AVAILABLE LOG PATHS: **
 {log_folder_path}
+{serial_console_prompt_block}
 **AVAILABLE CODE PATHS: **
 {code_path}
     """
@@ -621,7 +739,6 @@ async def async_analyze_default(
 
     # Create summary agent for final answer synthesis
     final_answer_prompt = _load_prompt("final_answer.txt", flow="default")
-    chat_options = create_agent_chat_options()
     summary_chat_client = AzureOpenAIChatClient(
         api_key=azure_openai_api_key,
         endpoint=azure_openai_endpoint,
@@ -633,9 +750,9 @@ async def async_analyze_default(
         description="Summarizes and formats final answer.",
         instructions=final_answer_prompt,
         tools=[],
-        temperature=chat_options.temperature,
-        top_p=chat_options.top_p,
-        additional_properties={"max_completion_tokens": chat_options.max_tokens},
+        temperature=AGENT_TEMPERATURE,
+        top_p=AGENT_TOP_P,
+        additional_properties={"max_completion_tokens": AGENT_MAX_TOKENS},
     )
 
     logger.info("Building Sequential workflow...")
@@ -679,15 +796,15 @@ async def async_analyze_default(
     async def _run_with_timeout_and_retry(
         coro_factory: Callable[[], Awaitable[str]], timeout_sec: float = 300.0
     ) -> str:
-        max_retries = 3
+        max_retries = 2
         last_exc: Exception | None = None
-        for attempt in range(max_retries + 1):
+        for attempt in range(max_retries):
             try:
                 return await asyncio.wait_for(coro_factory(), timeout=timeout_sec)
             except Exception as e:
                 last_exc = e
-                logger.info(f"[Magentic] Attempt {attempt + 1} failed: {e}")
-                if attempt == max_retries:
+                logger.info(f"Attempt {attempt + 1} failed: {e}")
+                if attempt == max_retries - 1:
                     raise
         raise last_exc if last_exc else RuntimeError("Unknown error")
 

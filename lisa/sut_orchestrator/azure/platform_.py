@@ -8,6 +8,7 @@ import math
 import os
 import re
 import sys
+import threading
 from copy import deepcopy
 from dataclasses import InitVar, dataclass, field
 from datetime import datetime
@@ -117,6 +118,7 @@ from .common import (
     DataDiskSchema,
     DiskPlacementType,
     SharedImageGallerySchema,
+    VhdDetails,
     check_or_create_resource_group,
     check_or_create_storage_account,
     convert_to_azure_node_space,
@@ -352,6 +354,9 @@ class AzurePlatformSchema:
     # timeout for deployment operations in seconds (default: 60 minutes)
     provisioning_timeout: int = field(default=3600)
 
+    # Enable logging of MANA driver/device information in test results
+    log_mana_information: bool = field(default=False)
+
     def __post_init__(self, *args: Any, **kwargs: Any) -> None:
         strip_strs(
             self,
@@ -478,6 +483,8 @@ class AzurePlatform(Platform):
             platform_utils.KEY_VMM_VERSION: platform_utils.get_vmm_version,
             platform_utils.KEY_MSHV_VERSION: platform_utils.get_mshv_version,
         }
+
+        self._private_key_lock = threading.Lock()
 
     @classmethod
     def type_name(cls) -> str:
@@ -752,7 +759,12 @@ class AzurePlatform(Platform):
             information[KEY_VM_GENERATION] = node.tools[VmGeneration].get_generation()
             node.log.debug(f"vm generation: {information[KEY_VM_GENERATION]}")
 
-            security_profile = node.features[SecurityProfile].get_settings()
+            # Guest nodes (like WslContainerNode) don't have features attribute
+            # Skip security profile collection for guest nodes
+            if hasattr(node, "features"):
+                security_profile = node.features[SecurityProfile].get_settings()
+            else:
+                security_profile = None
             if (
                 security_profile
                 and isinstance(security_profile, SecurityProfileSettings)
@@ -789,18 +801,45 @@ class AzurePlatform(Platform):
                 information[KEY_NVME_ENABLED] = _has_nvme_core and _has_nvme
                 node.log.debug(f"nvme enabled: {information[KEY_NVME_ENABLED]}")
 
-        node_runbook = node.capability.get_extended_runbook(AzureNodeSchema, AZURE)
-        if node_runbook:
-            information["location"] = node_runbook.location
-            information["vmsize"] = node_runbook.vm_size
-            information["image"] = node_runbook.get_image_name()
+        # Guest nodes don't have Azure-specific runbook information
+        # Only get node information for RemoteNode (not for GuestNode/WslContainerNode)
+        if isinstance(node, RemoteNode):
+            node_runbook = node.capability.get_extended_runbook(AzureNodeSchema, AZURE)
+            if node_runbook:
+                information["location"] = node_runbook.location
+                information["vmsize"] = node_runbook.vm_size
+                information["image"] = node_runbook.get_image_name()
         information["platform"] = self.type_name()
+
+        # Log MANA information if enabled in runbook
+        if self._azure_runbook.log_mana_information and node.is_connected:
+            self._collect_mana_information(node, information)
+
         return information
+
+    def _collect_mana_information(
+        self, node: Node, information: Dict[str, Any]
+    ) -> None:
+        """Collect MANA driver and device information if enabled in runbook."""
+        try:
+            node.log.debug("detecting mana device presence...")
+            information["mana_driver_present"] = node.nics.is_mana_driver_enabled()
+            information["mana_device_present"] = node.nics.is_mana_device_present()
+            information["pci_nics_count"] = len(node.nics.get_pci_nics())
+            node.log.debug(
+                f"mana_driver_present: {information['mana_driver_present']}, "
+                f"mana_device_present: {information['mana_device_present']}, "
+                f"pci_nics_count: {information['pci_nics_count']}"
+            )
+        except Exception as e:
+            node.log.debug(f"error detecting MANA information: {e}")
 
     def _get_disk_controller_type(self, node: Node) -> str:
         result: str = ""
         try:
-            result = node.features[Disk].get_hardware_disk_controller_type()
+            # Guest nodes (like WslContainerNode) don't have features attribute
+            if hasattr(node, "features"):
+                result = node.features[Disk].get_hardware_disk_controller_type()
         except Exception as e:
             # it happens on some error vms. Those error should be caught earlier in
             # test cases not here. So ignore any error here to collect information only.
@@ -1188,8 +1227,14 @@ class AzurePlatform(Platform):
         is_windows: bool = False
         arm_parameters.admin_username = self.runbook.admin_username
         # if no key or password specified, generate the key pair
-        if not self.runbook.admin_private_key_file and not self.runbook.admin_password:
-            self.runbook.admin_private_key_file = get_or_generate_key_pairs(self._log)
+        with self._private_key_lock:
+            if (
+                not self.runbook.admin_private_key_file
+                and not self.runbook.admin_password
+            ):
+                self.runbook.admin_private_key_file = get_or_generate_key_pairs(
+                    self._log
+                )
 
         if self.runbook.admin_private_key_file:
             arm_parameters.admin_key_data = get_public_key_data(
@@ -1240,9 +1285,18 @@ class AzurePlatform(Platform):
                     == features.get_azure_disk_type(schema.DiskType.UltraSSDLRS)
                 ]
             )
+
             # Set data disk array
             arm_parameters.data_disks = self._generate_data_disks(
                 node, node_arm_parameters
+            )
+
+            arm_parameters.is_data_disk_with_vhd = any(
+                [
+                    x
+                    for x in arm_parameters.data_disks
+                    if x.vhd_details is not None and x.vhd_details.vhd_uri != ""
+                ]
             )
 
             if not arm_parameters.location:
@@ -1404,6 +1458,15 @@ class AzurePlatform(Platform):
             vhd.cvm_metadata_path = get_deployable_storage_path(
                 self, vhd.cvm_metadata_path, azure_node_runbook.location, log
             )
+
+            # Process data VHD paths if provided
+            if vhd.data_vhd_paths:
+                for data_vhd in vhd.data_vhd_paths:
+                    if data_vhd.vhd_uri:
+                        data_vhd.vhd_uri = get_deployable_storage_path(
+                            self, data_vhd.vhd_uri, azure_node_runbook.location, log
+                        )
+
             azure_node_runbook.vhd = vhd
             azure_node_runbook.marketplace = None
             azure_node_runbook.shared_gallery = None
@@ -1471,6 +1534,16 @@ class AzurePlatform(Platform):
             vhd.cvm_metadata_path = get_deployable_storage_path(
                 self, vhd.cvm_metadata_path, arm_parameters.location, log
             )
+
+            # Process data VHD paths if provided
+            if vhd.data_vhd_paths:
+                for data_vhd in vhd.data_vhd_paths:
+                    if data_vhd.vhd_uri:
+                        # Validate and process each data VHD URI
+                        data_vhd.vhd_uri = get_deployable_storage_path(
+                            self, data_vhd.vhd_uri, arm_parameters.location, log
+                        )
+
             arm_parameters.vhd = vhd
             arm_parameters.osdisk_size_in_gb = max(
                 arm_parameters.osdisk_size_in_gb,
@@ -2003,6 +2076,7 @@ class AzurePlatform(Platform):
             # https://docs.microsoft.com/en-us/azure/virtual-machines/ncv2-series
             # https://docs.microsoft.com/en-us/azure/virtual-machines/ncv3-series
             # https://docs.microsoft.com/en-us/azure/virtual-machines/nd-series
+            # https://learn.microsoft.com/en-us/azure/virtual-machines/sizes/gpu-accelerated/nccadsh100v5-series
             # below VM size families don't support `Accelerated Networking` but
             # API return `True`, fix this issue temporarily will revert it till
             # bug fixed.
@@ -2012,6 +2086,7 @@ class AzurePlatform(Platform):
                 "standardncsv2family",
                 "standardncsv3family",
                 "standardndsfamily",
+                "standardnccads2023family",
             ]:
                 # update data path types if sriov feature is supported
                 node_space.network_interface.data_path.add(schema.NetworkDataPath.Sriov)
@@ -2305,7 +2380,40 @@ class AzurePlatform(Platform):
     ) -> List[DataDiskSchema]:
         data_disks: List[DataDiskSchema] = []
         assert node.capability.disk
-        if azure_node_runbook.marketplace:
+
+        # Handle data VHD paths if provided
+        if (
+            azure_node_runbook.vhd
+            and azure_node_runbook.vhd.vhd_path
+            and azure_node_runbook.vhd.data_vhd_paths
+        ):
+            for data_vhd in azure_node_runbook.vhd.data_vhd_paths:
+                if data_vhd.vhd_uri:
+                    if azure_node_runbook.data_disk_type == "UltraSSD_LRS":
+                        raise SkippedException(
+                            "Currently, LISA doesn't support 'UltraSSD_LRS' disk type "
+                            "for data disk with 'import' creation option."
+                        )
+                    result_dict = get_vhd_details(self, data_vhd.vhd_uri)
+                    data_disks.append(
+                        DataDiskSchema(
+                            node.capability.disk.data_disk_caching_type,
+                            0,  # size is not needed for imported disk
+                            0,
+                            0,
+                            azure_node_runbook.data_disk_type,
+                            DataDiskCreateOption.DATADISK_CREATE_OPTION_TYPE_IMPORT,
+                            VhdDetails(
+                                vhd_uri=data_vhd.vhd_uri,
+                                storage_account_name=result_dict.get("account_name"),
+                                storage_resource_group_name=result_dict.get(
+                                    "resource_group_name"
+                                ),
+                            ),
+                        )
+                    )
+
+        elif azure_node_runbook.marketplace:
             marketplace = self.get_image_info(
                 azure_node_runbook.location, azure_node_runbook.marketplace
             )
@@ -2328,6 +2436,7 @@ class AzurePlatform(Platform):
                             0,
                             azure_node_runbook.data_disk_type,
                             DataDiskCreateOption.DATADISK_CREATE_OPTION_TYPE_FROM_IMAGE,
+                            None,
                         )
                     )
         assert isinstance(
@@ -2351,6 +2460,7 @@ class AzurePlatform(Platform):
                     node.capability.disk.data_disk_throughput,
                     azure_node_runbook.data_disk_type,
                     DataDiskCreateOption.DATADISK_CREATE_OPTION_TYPE_EMPTY,
+                    None,
                 )
             )
         runbook = node.capability.get_extended_runbook(AzureNodeSchema)
